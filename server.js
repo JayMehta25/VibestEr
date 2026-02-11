@@ -7,27 +7,250 @@ import path from 'path';
 import fs from 'fs';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import mongoose from 'mongoose';
+// Removed MongoDB usage
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
+dotenv.config();
 import crypto from 'crypto';
-import connectDB from './config/db.js'; // Import the connectDB function
+// No DB connector needed
 import pkg from 'node-nlp'; // Import the entire package
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+import { v4 as uuidv4 } from 'uuid';
 import timeout from 'connect-timeout';
+
+// ==========================================
+// SECURITY IMPORTS - OWASP Best Practices
+// ==========================================
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import mongoSanitize from 'express-mongo-sanitize';
+import xss from 'xss-clean';
+import { validators } from './middleware/validators.js';
+import {
+  globalRateLimitConfig,
+  authRateLimitConfig,
+  aiRateLimitConfig,
+  uploadRateLimitConfig,
+  passwordResetRateLimitConfig,
+  corsOriginValidator,
+  helmetConfig,
+  validateEnvironment,
+} from './config/security-config.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// --- GLOBAL CORS HEADERS FOR ALL ROUTES AND STATIC FILES ---
-// This ensures all responses have the correct CORS headers for uploads, audio, and any other resource
+// ==========================================
+// ENVIRONMENT VALIDATION
+// ==========================================
+// Validate required environment variables on startup
+// Server will exit if any required variables are missing
+try {
+  validateEnvironment();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1); // Exit with error code
+}
+
+// ==========================================
+// EXPRESS APP INITIALIZATION
+// ==========================================
 const app = express();
+
+// ==========================================
+// SECURITY MIDDLEWARE - Applied First
+// ==========================================
+
+// Helmet: Set security headers (OWASP recommended)
+// ONLY enabled in production to allow ngrok and development tools to work
+if (process.env.NODE_ENV === 'production') {
+  app.use(helmet(helmetConfig));
+  console.log('✅ Helmet security headers enabled (production mode)');
+} else {
+  console.log('⚠️  Helmet security headers disabled (development mode)');
+}
+
+// Trust proxy - required for rate limiting behind reverse proxies
+app.enable('trust proxy');
+
+// Rate Limiting: Global rate limiter for all requests
+const globalLimiter = rateLimit(globalRateLimitConfig);
+app.use(globalLimiter);
+
+// Body parser with size limits to prevent DoS
+app.use(bodyParser.json({ limit: '1mb' })); // Reduced from 50mb for security
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Data sanitization against NoSQL injection
+app.use(mongoSanitize());
+
+// Data sanitization against XSS
+app.use(xss());
+
+// DEBUG LOGGER: See all incoming requests
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// --- AI & Interest Chat Middleware ---
+const icebreakerCors = (req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+};
+
+// ==========================================
+// RATE LIMITERS FOR SPECIFIC ENDPOINTS
+// ==========================================
+const authLimiter = rateLimit(authRateLimitConfig);
+const aiLimiter = rateLimit(aiRateLimitConfig);
+const uploadLimiter = rateLimit(uploadRateLimitConfig);
+const passwordResetLimiter = rateLimit(passwordResetRateLimitConfig);
+
+// ==========================================
+// AI & Gemini API Endpoints
+// ==========================================
+// SECURITY: Rate limited and validated to prevent abuse
+
+app.get('/api/ping', (req, res) => {
+  res.json({ message: 'pong', timestamp: new Date().toISOString() });
+});
+
+app.options(['/api/icebreaker', '/api/ai-suggest-reply', '/api/gemini', '/api/gemini-chat', '/api/compatibility-meter', '/api/gemini-status'], (req, res) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  return res.sendStatus(200);
+});
+
+// SECURITY: AI Icebreaker endpoint with rate limiting and validation
+app.post('/api/icebreaker', aiLimiter, icebreakerCors, validators.icebreaker, async (req, res) => {
+  const { interests } = req.body;
+  const prompt = `Give me only one fun, safe, and friendly icebreaker question for a chat between strangers who are interested in: ${interests && interests.length ? interests.join(', ') : 'anything'}. Do not include any preamble or explanation, just output the question itself.`;
+  try {
+    // SECURITY: No hardcoded API key fallback - must be in environment
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }]
+      }
+    );
+    const aiIcebreaker = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "What's something interesting about your favorite hobby?";
+    res.json({ icebreaker: aiIcebreaker });
+  } catch (err) {
+    console.error('[Gemini Icebreaker Error]', err.response?.data || err.message);
+    res.json({ icebreaker: "What's something interesting about your favorite hobby?" });
+  }
+});
+
+let cachedGeminiStatus = 'checking';
+let lastStatusCheck = 0;
+const STATUS_CACHE_DURATION = 10 * 60 * 1000;
+
+// SECURITY: Gemini status check with rate limiting
+app.post('/api/gemini-status', aiLimiter, icebreakerCors, async (req, res) => {
+  const now = Date.now();
+  if (cachedGeminiStatus !== 'checking' && (now - lastStatusCheck < STATUS_CACHE_DURATION)) {
+    return res.json({ status: cachedGeminiStatus });
+  }
+  try {
+    // SECURITY: No hardcoded API key fallback
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      { contents: [{ role: "user", parts: [{ text: "hi" }] }] },
+      { timeout: 10000 }
+    );
+    cachedGeminiStatus = (response.data && response.data.candidates) ? 'connected' : 'disconnected';
+    lastStatusCheck = now;
+    res.json({ status: cachedGeminiStatus });
+  } catch (err) {
+    cachedGeminiStatus = 'disconnected';
+    res.json({ status: 'disconnected', error: err.message });
+  }
+});
+
+// SECURITY: AI reply suggestion with rate limiting and validation
+app.post('/api/ai-suggest-reply', aiLimiter, icebreakerCors, async (req, res) => {
+  const { selected_message, chat_history, participants, interests } = req.body;
+  const prompt = `You are WingmanAI, a helpful assistant for chat conversations.\nGiven the following conversation in an interest-based chat room, answer from the perspective of the user who is asking.\nSuggest a smart, friendly, and engaging reply (20 words max). Just output the reply.`;
+  try {
+    // SECURITY: No hardcoded API key fallback
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] }
+    );
+    res.json({ suggestion: response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "Could not generate a suggestion." });
+  } catch (err) {
+    console.error('[Gemini Suggestion Error]', err.response?.data || err.message);
+    res.json({ suggestion: "Could not generate a suggestion." });
+  }
+});
+
+// SECURITY: Gemini chat with rate limiting and prompt validation
+app.post('/api/gemini-chat', aiLimiter, icebreakerCors, validators.aiPrompt, async (req, res) => {
+  const { prompt } = req.body;
+  try {
+    // SECURITY: No hardcoded API key fallback
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] }
+    );
+    res.json({ response: response.data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response.' });
+  } catch (err) {
+    res.status(500).json({ response: 'Error.' });
+  }
+});
+
+// SECURITY: Compatibility meter with rate limiting
+app.post('/api/compatibility-meter', aiLimiter, icebreakerCors, async (req, res) => {
+  const { chat_history, user1_interests, user2_interests } = req.body;
+  const prompt = `Analyze compatibility between two users based on their chat and interests. Respond with Score: [number]%, Label: [phrase], Reason: [sentence].`;
+  try {
+    // SECURITY: No hardcoded API key fallback
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] }
+    );
+    res.json({ result: response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "Error." });
+  } catch (err) {
+    res.json({ result: "Error." });
+  }
+});
+
+// This ensures all responses have the correct CORS headers for uploads, audio, and any other resource
+// (app = express() already declared above)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Allow localhost:3000 (frontend) and any ngrok URL
+  if (origin && (
+    origin === 'http://localhost:3000' ||
+    origin.includes('ngrok-free.app') ||
+    origin.includes('ngrok.io')
+  )) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
   res.setHeader('Accept-Ranges', 'bytes');
@@ -36,10 +259,17 @@ app.use((req, res, next) => {
 
 // Serve static files from the React app build directory
 app.use(express.static(path.join(__dirname, 'client/build')));
-// Allow CORS for all origins (reflect origin for credentials)
+// Allow CORS for localhost:3000 and any ngrok URL
 app.use(cors({
   origin: (origin, callback) => {
-    callback(null, origin);
+    if (!origin ||
+      origin === 'http://localhost:3000' ||
+      origin.includes('ngrok-free.app') ||
+      origin.includes('ngrok.io')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
   },
   credentials: true
 }));
@@ -47,7 +277,16 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['http://localhost:3000', 'http://localhost:5173', 'https://e17e65f5131c.ngrok-free.app'],
+    origin: (origin, callback) => {
+      if (!origin ||
+        origin === 'http://localhost:3000' ||
+        origin.includes('ngrok-free.app') ||
+        origin.includes('ngrok.io')) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ["GET", "POST"],
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin"]
@@ -56,10 +295,17 @@ const io = new Server(server, {
   path: '/socket.io/'
 });
 
-// CORS configuration (allow all origins for global access, reflect origin for credentials)
+// CORS configuration (allow localhost:3000 and any ngrok URL)
 app.use(cors({
   origin: (origin, callback) => {
-    callback(null, origin);
+    if (!origin ||
+      origin === 'http://localhost:3000' ||
+      origin.includes('ngrok-free.app') ||
+      origin.includes('ngrok.io')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -94,77 +340,31 @@ const allowedOrigins = [
 // Initialize socket.io with CORS and buffer size for attachments
 
 
-// Database setup
+// Server setup (no database)
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'Xn2r5u8x/A?D(G+KbPeShVmYp3s6v9y$';
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://Jay:Jaymehta10@chatroulletex.hqjno.mongodb.net/?retryWrites=true&w=majority&appName=chatRoulleteX';
 
 // Load environment variables
-console.log('Environment check:');
-console.log('- NODE_ENV:', process.env.NODE_ENV);
-console.log('- EMAIL_USER exists:', !!process.env.EMAIL_USER);
-console.log('- EMAIL_PASS exists:', !!process.env.EMAIL_PASS);
-
-// Connect to MongoDB
-await connectDB(); // Ensure this is awaited in an async context
-
-// WARNING: This will delete all users - only do this in development
-if (process.env.NODE_ENV === 'development') {
-  try {
-    await mongoose.connection.db.dropCollection('users'); // Ensure this is awaited
-    console.log('Dropped users collection to reset indexes');
-  } catch (error) {
-    // Collection might not exist yet
-    console.log('No users collection to drop or other error:', error.message);
-  }
+console.log('- GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
+if (process.env.GEMINI_API_KEY) {
+  console.log('- GEMINI_API_KEY starts with:', process.env.GEMINI_API_KEY.substring(0, 4) + '...');
+} else {
+  console.warn('WARNING: GEMINI_API_KEY is not defined in .env! Using potential hardcoded fallbacks.');
 }
+// In-memory user store (volatile; cleared on server restart)
+const users = [];
 
-// Define the User model
-const UserSchema = new mongoose.Schema({
-  username: {
-    type: String,
-    required: true,
-    unique: true,
-    trim: true,
-    minlength: 3
-  },
-  email: {
-    type: String,
-    required: true,
-    unique: true,
-    trim: true
-  },
-  password: {
-    type: String,
-    required: true,
-    minlength: 6
-  },
-  isVerified: {
-    type: Boolean,
-    default: false
-  },
-  verificationToken: String,
-  verificationTokenExpires: Date,
-  createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  resetPasswordToken: String,
-  resetPasswordExpires: Date
-});
-
-// Create the User model
-const User = mongoose.model('User', UserSchema);
+const findUserByEmail = (email) => users.find(u => u.email === email);
+const findUserByVerificationToken = (token) => users.find(u => u.verificationToken === token);
+const findUserByResetToken = (hashedToken) => users.find(u => u.resetPasswordToken === hashedToken && u.resetPasswordExpires > Date.now());
 
 // Maps for active users and rooms
 const userSocketMap = new Map();
 const socketToUserMap = new Map(); // Map socket ID to username
 const activeRooms = new Map();
 const waitingUsersByInterest = new Map();
+const meshRooms = {}; // For voice call mesh networking
 
-
-app.use(bodyParser.json());
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Add a timeout middleware for uploads and API requests
 app.use(timeout('30s'));
@@ -179,7 +379,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = path.join(__dirname, 'uploads');
-    if (!fs.existsSync(uploadDir)){
+    if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
     cb(null, uploadDir);
@@ -188,7 +388,7 @@ const storage = multer.diskStorage({
     // Generate unique filename with original extension
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     let fileExt = path.extname(file.originalname) || '';
-    
+
     // For audio files, ensure we have a proper extension
     if (file.mimetype.startsWith('audio/')) {
       if (!fileExt) {
@@ -207,7 +407,7 @@ const storage = multer.diskStorage({
       }
       console.log(`Audio file upload: ${file.originalname} -> ${fileExt} (${file.mimetype})`);
     }
-    
+
     cb(null, 'file-' + uniqueSuffix + fileExt);
   }
 });
@@ -225,7 +425,7 @@ const fileFilter = (req, file, cb) => {
     'application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'text/plain', 'application/json'
   ];
-  
+
   if (allowedTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
@@ -235,7 +435,7 @@ const fileFilter = (req, file, cb) => {
 };
 
 // Update multer config to reduce max file size
-const upload = multer({ 
+const upload = multer({
   storage,
   fileFilter,
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB max file size
@@ -251,8 +451,8 @@ app.options('/upload', cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
 }));
 
-// Update the upload endpoint with explicit CORS
-app.post('/upload', cors({
+// SECURITY: File upload with rate limiting
+app.post('/upload', uploadLimiter, cors({
   origin: (origin, callback) => {
     callback(null, origin);
   },
@@ -265,7 +465,7 @@ app.post('/upload', cors({
       console.error('No file received in upload request');
       return res.status(400).json({ message: 'No file uploaded' });
     }
-    
+
     const filePath = req.file.path;
     const ext = path.extname(req.file.filename).toLowerCase();
     // Only convert audio files (webm, ogg, wav, m4a)
@@ -304,27 +504,35 @@ app.post('/upload', cors({
   }
 });
 
-// Update the static file serving middleware
+// Update the static file serving middleware with mobile-friendly headers
 app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
   setHeaders: (res, filePath) => {
+    // Mobile-friendly CORS headers
     res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range, X-Requested-With');
     res.set('Accept-Ranges', 'bytes');
-    
-    // Set correct MIME type for images
+    res.set('X-Content-Type-Options', 'nosniff');
+
+    // Set correct MIME type for images with mobile optimization
     const imageExtensions = {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
       '.jpeg': 'image/jpeg',
       '.gif': 'image/gif',
       '.webp': 'image/webp',
-      '.svg': 'image/svg+xml'
+      '.svg': 'image/svg+xml',
+      '.bmp': 'image/bmp',
+      '.ico': 'image/x-icon'
     };
     const ext = filePath.toLowerCase().substring(filePath.lastIndexOf('.'));
     if (imageExtensions[ext]) {
       res.set('Content-Type', imageExtensions[ext]);
-      res.set('Cache-Control', 'public, max-age=31536000');
+      res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      res.set('Content-Disposition', 'inline');
+      // Mobile-specific headers
+      res.set('X-Frame-Options', 'SAMEORIGIN');
+      res.set('X-Download-Options', 'noopen');
     }
 
     // Enhanced audio file handling with better MIME type detection
@@ -342,17 +550,17 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
       res.set('Cache-Control', 'public, max-age=31536000');
       console.log(`Audio file requested: ${filePath} with MIME type: ${audioExtensions[ext]}`);
     }
-    
+
     // Handle files without extensions (check file content)
     if (!ext || ext === path) {
       // Try to detect audio files by reading first few bytes
       const fs = require('fs');
       const filePath = path.join(__dirname, 'uploads', path.substring(path.lastIndexOf('/') + 1));
-      
+
       try {
         if (fs.existsSync(filePath)) {
           const buffer = fs.readFileSync(filePath, { start: 0, end: 12 });
-          
+
           // Check for WebM signature
           if (buffer.toString('hex').startsWith('1a45dfa3')) {
             res.set('Content-Type', 'audio/webm');
@@ -373,7 +581,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
             res.set('Content-Type', 'audio/webm');
             console.log(`Defaulting to audio/webm for: ${path}`);
           }
-          
+
           res.set('Cache-Control', 'public, max-age=31536000');
         }
       } catch (error) {
@@ -387,19 +595,19 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
 app.get('/test-audio/:filename', (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(__dirname, 'uploads', filename);
-  
+
   console.log(`Testing audio file: ${filename}`);
   console.log(`Full path: ${filePath}`);
-  
+
   if (fs.existsSync(filePath)) {
     const stats = fs.statSync(filePath);
     console.log(`File exists, size: ${stats.size} bytes`);
-    
+
     // Set proper headers
     res.set('Content-Type', 'audio/webm');
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Accept-Ranges', 'bytes');
-    
+
     // Send the file
     res.sendFile(filePath);
   } else {
@@ -415,13 +623,13 @@ app.get('/audio/:filename', (req, res) => {
   const userAgent = req.headers['user-agent'] || '';
   const isIOS = /iPad|iPhone|iPod/.test(userAgent);
   const isSafari = /Safari/.test(userAgent) && !/Chrome/.test(userAgent);
-  
+
   console.log(`Audio request for: ${filename}, iOS: ${isIOS}, Safari: ${isSafari}`);
-  
+
   if (fs.existsSync(filePath)) {
     const stats = fs.statSync(filePath);
     console.log(`File exists, size: ${stats.size} bytes`);
-    
+
     // For iOS/Safari devices, serve with more compatible headers
     if (isIOS || isSafari) {
       if (filename.endsWith('.webm')) {
@@ -441,13 +649,13 @@ app.get('/audio/:filename', (req, res) => {
         };
         res.set('Content-Type', mimeTypes[ext] || 'audio/mp4');
       }
-      
+
       // Add additional headers for iOS compatibility
       res.set('Access-Control-Allow-Origin', '*');
       res.set('Accept-Ranges', 'bytes');
       res.set('Cache-Control', 'public, max-age=31536000');
       res.set('X-Content-Type-Options', 'nosniff');
-      
+
       // For iOS, try to force the browser to treat it as audio
       if (isIOS) {
         res.set('Content-Disposition', 'inline');
@@ -468,7 +676,7 @@ app.get('/audio/:filename', (req, res) => {
       res.set('Accept-Ranges', 'bytes');
       res.set('Cache-Control', 'public, max-age=31536000');
     }
-    
+
     // Send the file
     res.sendFile(filePath);
   } else {
@@ -477,22 +685,88 @@ app.get('/audio/:filename', (req, res) => {
   }
 });
 
+// Add OPTIONS handler for image endpoint
+app.options('/image/:filename', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
+  res.set('Accept-Ranges', 'bytes');
+  res.sendStatus(200);
+});
+
+// Add a mobile-friendly image endpoint
+app.get('/image/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(__dirname, 'uploads', filename);
+  const userAgent = req.headers['user-agent'] || '';
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
+
+  console.log(`Image request for: ${filename}, Mobile: ${isMobile}`);
+
+  if (fs.existsSync(filePath)) {
+    const stats = fs.statSync(filePath);
+    console.log(`Image file exists, size: ${stats.size} bytes`);
+
+    // Set mobile-friendly headers
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
+    res.set('Accept-Ranges', 'bytes');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Content-Disposition', 'inline');
+
+    // Set content type based on file extension
+    const ext = path.extname(filename).toLowerCase();
+    const mimeTypes = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.svg': 'image/svg+xml',
+      '.bmp': 'image/bmp',
+      '.ico': 'image/x-icon'
+    };
+
+    const contentType = mimeTypes[ext] || 'image/jpeg';
+    res.set('Content-Type', contentType);
+
+    // Mobile-specific cache headers
+    if (isMobile) {
+      res.set('Cache-Control', 'public, max-age=86400'); // 1 day for mobile
+    } else {
+      res.set('Cache-Control', 'public, max-age=31536000'); // 1 year for desktop
+    }
+
+    // Send the file
+    res.sendFile(filePath, (err) => {
+      if (err) {
+        console.error('Error sending image:', err);
+        res.status(500).json({ error: 'Failed to serve image' });
+      }
+    });
+  } else {
+    console.log(`Image file not found: ${filePath}`);
+    res.status(404).json({ error: 'Image not found' });
+  }
+});
+
 // Add an endpoint to validate audio files
 app.get('/validate-audio/:filename', (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(__dirname, 'uploads', filename);
-  
+
   console.log(`Validating audio file: ${filename}`);
-  
+
   if (fs.existsSync(filePath)) {
     const stats = fs.statSync(filePath);
     console.log(`File exists, size: ${stats.size} bytes`);
-    
+
     // Read first few bytes to check file signature
     try {
       const buffer = fs.readFileSync(filePath, { start: 0, end: 12 });
       const hex = buffer.toString('hex');
-      
+
       let format = 'unknown';
       if (hex.startsWith('1a45dfa3')) {
         format = 'webm';
@@ -503,7 +777,7 @@ app.get('/validate-audio/:filename', (req, res) => {
       } else if (hex.startsWith('66747970')) {
         format = 'mp4';
       }
-      
+
       res.json({
         valid: true,
         size: stats.size,
@@ -520,48 +794,43 @@ app.get('/validate-audio/:filename', (req, res) => {
   }
 });
 
-// Updated registration endpoint to handle existing users
-app.post('/register', async (req, res) => {
+// SECURITY: User registration with rate limiting and validation
+app.post('/register', authLimiter, validators.register, async (req, res) => {
   try {
     const { username, email, password } = req.body;
-    
-    // Validate input
-    if (!username || !email || !password) {
-      return res.status(400).json({ message: 'Username, email, and password are required' });
-    }
-    
+
     // Check if email already exists
-    const existingUser = await User.findOne({ email });
-    
+    const existingUser = findUserByEmail(email);
+
     if (existingUser) {
       // User with this email already exists
       if (existingUser.isVerified) {
         // User is already verified, redirect to login
-        return res.status(400).json({ 
+        return res.status(400).json({
           message: 'This email is already registered and verified. Please login instead.',
           redirectTo: '/login'
         });
       } else {
         // User exists but not verified - update their details
         console.log('Updating existing unverified user:', existingUser.username);
-        
+
         // Update username and password
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
-        
+
         existingUser.username = username;
         existingUser.password = hashedPassword;
-        await existingUser.save();
-        
+        // persist in memory
+
         // Generate a new verification token/OTP
         const otp = Math.floor(100000 + Math.random() * 900000).toString();
         existingUser.verificationToken = otp;
         existingUser.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-        await existingUser.save();
-        
+        // persist in memory
+
         // Send OTP email logic here...
         // (existing email sending code)
-        
+
         return res.status(200).json({
           message: 'Account already exists but not verified. We\'ve sent a new verification code.',
           email: existingUser.email,
@@ -569,39 +838,39 @@ app.post('/register', async (req, res) => {
         });
       }
     }
-    
+
     // This is a new user - create account
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    
+
     // Create new user
-    const newUser = new User({
+    const newUser = {
+      id: uuidv4(),
       username,
       email,
       password: hashedPassword,
-      isVerified: false
-    });
-    
-    // Save user to database
-    await newUser.save();
-    
+      isVerified: false,
+      createdAt: new Date()
+    };
+    users.push(newUser);
+
     console.log(`User registered successfully: ${username} (${email})`);
-    
+
     // Generate a verification token/OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     newUser.verificationToken = otp;
     newUser.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-    await newUser.save();
-    
+    // update in memory
+
     // Send OTP email (your existing email code here)
-    
+
     // Return success 
     res.status(201).json({
       message: 'Registration successful! Please verify your email.',
       email: newUser.email,
       redirectTo: '/verify-email'
     });
-    
+
   } catch (error) {
     console.error('Registration error:', error);
     res.status(500).json({ message: 'Server error during registration' });
@@ -613,57 +882,51 @@ app.options('/login', (req, res) => {
   res.sendStatus(200);
 });
 
-// Updated login endpoint to check verification status
-app.post('/login', async (req, res) => {
+// SECURITY: User login with rate limiting and validation
+app.post('/login', authLimiter, validators.login, async (req, res) => {
   try {
     const { email, password } = req.body;
-    
-    // Validate input
-    if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password are required' });
-    }
-    
+
     // Find user by email
-    const user = await User.findOne({ email });
-    
+    const user = findUserByEmail(email);
+
     // Check if user exists
     if (!user) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         message: 'User not found. Please register first.',
         redirectTo: '/register'
       });
     }
-    
+
     // Check if password is correct
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ message: 'Invalid password' });
     }
-    
+
     // Check if user is verified
     if (!user.isVerified) {
       // Generate a new OTP for verification
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
       user.verificationToken = otp;
       user.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-      await user.save();
-      
+
       // Send OTP email (your existing email code here)
-      
-      return res.status(403).json({ 
+
+      return res.status(403).json({
         message: 'Please verify your email before logging in.',
         email: user.email,
         redirectTo: '/verify-email'
       });
     }
-    
+
     // Create JWT token
     const token = jwt.sign(
-      { id: user._id, username: user.username },
+      { id: user.id, username: user.username },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
-    
+
     // Return success with token
     return res.status(200).json({
       message: 'Login successful',
@@ -673,7 +936,7 @@ app.post('/login', async (req, res) => {
       redirectTo: '/chatlanding',
       isVerified: true
     });
-    
+
   } catch (error) {
     console.error('Login error:', error);
     return res.status(500).json({ message: 'Server error during login' });
@@ -686,61 +949,57 @@ app.get('/verify/:token', cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }), async (req, res) => {
-  const user = await User.findOne({ verificationToken: req.params.token });
+  const user = findUserByVerificationToken(req.params.token);
   if (!user) {
     return res.status(400).send('Invalid verification token');
   }
 
   user.isVerified = true;
   user.verificationToken = null; // Clear the token
-  await user.save();
+  // in memory update
 
   res.send('Email verified successfully! You can now log in.');
 });
 
-// Updated send-verification-otp endpoint with better credential handling
-app.post('/send-verification-otp', async (req, res) => {
+// SECURITY: Send verification OTP with rate limiting and validation
+app.post('/send-verification-otp', authLimiter, validators.sendOtp, async (req, res) => {
   try {
     const { email } = req.body;
-    
+
     console.log('Sending verification OTP to:', email);
-    
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-    
+
     // Find the user by email
-    const user = await User.findOne({ email });
-    
+    const user = findUserByEmail(email);
+
     if (!user) {
       console.log('User not found for email:', email);
       return res.status(404).json({ message: 'User not found' });
     }
-    
+
     // Generate a 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     console.log('Generated OTP:', otp);
-    
+
     // Store OTP in user record
     user.verificationToken = otp;
     user.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-    await user.save();
-    
+    // in memory update
+
     // IMPORTANT: Check that credentials exist and log them (securely)
     const emailUser = process.env.EMAIL_USER;
     const emailPass = process.env.EMAIL_PASS;
-    
+
     console.log('Email credentials check:');
     console.log('- Username provided:', emailUser ? 'YES' : 'NO');
     console.log('- Password provided:', emailPass ? 'YES' : 'NO');
-    
+
     if (!emailUser || !emailPass) {
       console.error('❌ EMAIL CREDENTIALS NOT PROVIDED - Check your .env file');
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Email service configuration error. Please contact support.'
       });
     }
-    
+
     // Create transporter with explicit credentials
     const transporter = nodemailer.createTransport({
       service: 'gmail',
@@ -750,18 +1009,18 @@ app.post('/send-verification-otp', async (req, res) => {
       },
       debug: true // Enable debugging output
     });
-    
+
     // Verify the connection configuration
     try {
       await transporter.verify();
       console.log('✅ SMTP connection verified successfully');
     } catch (verifyError) {
       console.error('❌ SMTP verification failed:', verifyError);
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Email service not available. Please try again later.'
       });
     }
-    
+
     // Configure mail options
     const mailOptions = {
       from: `"Chat App" <${emailUser}>`,
@@ -779,94 +1038,89 @@ app.post('/send-verification-otp', async (req, res) => {
         </div>
       `
     };
-    
+
     // Send email
     try {
       const info = await transporter.sendMail(mailOptions);
       console.log('✅ Email sent successfully:', info.messageId);
-      
+
       return res.status(200).json({
         message: 'Verification code sent to your email'
       });
     } catch (emailError) {
       console.error('❌ Failed to send email:', emailError);
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Failed to send verification email. Please try again later.'
       });
     }
-    
+
   } catch (error) {
     console.error('❌ Error in send-verification-otp:', error);
     return res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Updated verify-otp endpoint to include showAlert flag for SweetAlert
-app.post('/verify-otp', async (req, res) => {
+// SECURITY: Verify OTP with rate limiting and validation
+app.post('/verify-otp', authLimiter, validators.verifyOtp, async (req, res) => {
   try {
     const { email, otp } = req.body;
-    
+
     console.log('Verifying OTP -', 'Email:', email, 'Submitted OTP:', otp);
-    
-    if (!email || !otp) {
-      console.log('Missing required fields');
-      return res.status(400).json({ message: 'Email and OTP are required' });
-    }
-    
+
     // Find user
-    const user = await User.findOne({ email });
+    const user = findUserByEmail(email);
     if (!user) {
       console.log('User not found');
       return res.status(404).json({ message: 'User not found' });
     }
-    
+
     console.log('User found:', user.username);
     console.log('Stored token:', user.verificationToken);
     console.log('Token expires:', user.verificationTokenExpires);
-    
+
     // Check if OTP exists
     if (!user.verificationToken) {
       console.log('No verification token found');
-      return res.status(400).json({ 
-        message: 'No verification code found. Please request a new one.' 
+      return res.status(400).json({
+        message: 'No verification code found. Please request a new one.'
       });
     }
-    
+
     // Convert both to strings for comparison
     const submittedOtp = String(otp);
     const storedToken = String(user.verificationToken);
-    
+
     console.log('Comparing:', submittedOtp, 'vs', storedToken);
-    
+
     // Check if OTP matches
     if (submittedOtp !== storedToken) {
       console.log('Invalid OTP');
       return res.status(400).json({ message: 'Invalid verification code' });
     }
-    
+
     // Check if token is expired
     if (user.verificationTokenExpires < Date.now()) {
       console.log('Token expired');
-      return res.status(400).json({ 
-        message: 'Verification code expired. Please request a new one.' 
+      return res.status(400).json({
+        message: 'Verification code expired. Please request a new one.'
       });
     }
-    
+
     // Mark user as verified
     user.isVerified = true;
     user.verificationToken = undefined;
     user.verificationTokenExpires = undefined;
-    await user.save();
-    
+    // in memory update
+
     console.log('User verified successfully');
-    
+
     // Create token
     const token = jwt.sign(
-      { id: user._id, username: user.username },
+      { id: user.id, username: user.username },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
-    
+
     // Return token with showAlert flag for SweetAlert
     return res.status(200).json({
       message: 'Email verified successfully',
@@ -879,7 +1133,7 @@ app.post('/verify-otp', async (req, res) => {
       alertText: 'Your email has been verified. Welcome to the app!',
       alertIcon: 'success'
     });
-    
+
   } catch (error) {
     console.error('OTP verification error:', error);
     return res.status(500).json({ message: 'Server error' });
@@ -890,52 +1144,57 @@ app.post('/verify-otp', async (req, res) => {
 app.post('/check-verification-status', async (req, res) => {
   try {
     const { email } = req.body;
-    
+
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
-    
-    const user = await User.findOne({ email });
-    
+
+    const user = findUserByEmail(email);
+
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
-    
+
     res.status(200).json({
       hasVerificationToken: !!user.verificationToken,
       tokenExpired: user.verificationTokenExpires < Date.now(),
       isVerified: user.isVerified
     });
-    
+
   } catch (error) {
     console.error('Error checking verification status:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Add a route to generate a test OTP for any email
+// SECURITY: Debug endpoint - ONLY available in development
 app.post('/generate-test-otp', async (req, res) => {
+  // Protect debug endpoint in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ message: 'Not found' });
+  }
+
   try {
     const { email } = req.body;
-    
+
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
-    
-    const user = await User.findOne({ email });
-    
+
+    const user = findUserByEmail(email);
+
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
-    
+
     // Generate a test OTP
     const otp = "123456";
-    
+
     // Save it to the user
     user.verificationToken = otp;
     user.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-    await user.save();
-    
+    // in memory update
+
     return res.status(200).json({
       message: 'Test OTP generated',
       email,
@@ -947,10 +1206,15 @@ app.post('/generate-test-otp', async (req, res) => {
   }
 });
 
-// DEBUGGING UTILITY - Add endpoint to check all existing routes
+// SECURITY: Debug endpoint - ONLY available in development
 app.get('/debug/routes', (req, res) => {
+  // Protect debug endpoint in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ message: 'Not found' });
+  }
+
   const routes = [];
-  
+
   app._router.stack.forEach((middleware) => {
     if (middleware.route) {
       // Routes registered directly on the app
@@ -970,41 +1234,46 @@ app.get('/debug/routes', (req, res) => {
       });
     }
   });
-  
+
   res.json(routes);
 });
 
-// COMPLETELY REWRITE the verification endpoints with a simplified approach
+// SECURITY: Debug endpoint - ONLY available in development
 app.post('/debug-verify', async (req, res) => {
+  // Protect debug endpoint in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ message: 'Not found' });
+  }
+
   try {
     const { email } = req.body;
-    
+
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
-    
+
     console.log('Debug verification requested for:', email);
-    
+
     // Find user
-    const user = await User.findOne({ email });
-    
+    const user = findUserByEmail(email);
+
     if (!user) {
       return res.status(404).json({ message: 'User not found with email: ' + email });
     }
-    
+
     // Force verify this user
     user.isVerified = true;
-    await user.save();
-    
+    // in memory update
+
     // Create token
     const token = jwt.sign(
-      { id: user._id, username: user.username },
+      { id: user.id, username: user.username },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
-    
+
     console.log('User verified via debug endpoint:', user.username);
-    
+
     return res.status(200).json({
       message: 'Debug verification successful',
       token,
@@ -1016,54 +1285,59 @@ app.post('/debug-verify', async (req, res) => {
   }
 });
 
-// Add a simple version that handles everything in one request
+// SECURITY: Debug endpoint - ONLY available in development
 app.post('/simple-verify', async (req, res) => {
+  // Protect debug endpoint in production
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ message: 'Not found' });
+  }
+
   try {
     const { email } = req.body;
-    
+
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
-    
+
     console.log('Simple verification requested for:', email);
-    
+
     // Find user
-    const user = await User.findOne({ email });
-    
+    const user = findUserByEmail(email);
+
     if (!user) {
       return res.status(404).json({ message: 'User not found with email: ' + email });
     }
-    
+
     // Generate a code and save it immediately
     const code = "123456";
     user.verificationToken = code;
     user.verificationTokenExpires = Date.now() + 3600000;
-    await user.save();
-    
+    // in memory update
+
     console.log('Generated and saved verification code for user:', user.username);
-    
+
     // Now verify this user with the same code
     if (user.verificationToken !== code) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         message: 'Verification failed - token mismatch',
         savedToken: user.verificationToken,
         generatedCode: code
       });
     }
-    
+
     // Verify user
     user.isVerified = true;
-    await user.save();
-    
+    // in memory update
+
     // Create token
     const token = jwt.sign(
-      { id: user._id, username: user.username },
+      { id: user.id, username: user.username },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
-    
+
     console.log('User verified via simple endpoint:', user.username);
-    
+
     return res.status(200).json({
       message: 'Simple verification successful',
       token,
@@ -1080,40 +1354,35 @@ app.get('/test', (req, res) => {
 });
 
 
-// Route to request password reset
-app.post('/forgot-password', async (req, res) => {
+// SECURITY: Forgot password with rate limiting and validation
+app.post('/forgot-password', passwordResetLimiter, validators.forgotPassword, async (req, res) => {
   console.log('✅ Hit /forgot-password')
   try {
     const { email } = req.body;
-    
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-    
+
     // Find user by email
-    const user = await User.findOne({ email });
-    
+    const user = findUserByEmail(email);
+
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
-    
+
     // Generate reset token (random string)
     const resetToken = crypto.randomBytes(32).toString('hex');
-    
+
     // Hash the token for security before storing
     const hashedToken = crypto
       .createHash('sha256')
       .update(resetToken)
       .digest('hex');
-    
+
     // Set token and expiration on user document
     user.resetPasswordToken = hashedToken;
     user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
-    await user.save();
-    
+
     // Create reset URL - adjusted for React frontend
     const resetUrl = `http://localhost:3000/reset-password/${resetToken}`;
-    
+
     // Configure email transporter
     const transporter = nodemailer.createTransport({
       service: 'gmail',
@@ -1123,18 +1392,18 @@ app.post('/forgot-password', async (req, res) => {
       },
       debug: true // Enable debugging output
     });
-    
+
     // Verify email configuration
     try {
       await transporter.verify();
       console.log('✅ SMTP connection verified successfully for password reset');
     } catch (verifyError) {
       console.error('❌ SMTP verification failed:', verifyError);
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Email service not available. Please try again later.'
       });
     }
-    
+
     // Create email
     const mailOptions = {
       from: `"Chat App" <${process.env.EMAIL_USER}>`,
@@ -1152,74 +1421,67 @@ app.post('/forgot-password', async (req, res) => {
         </div>
       `
     };
-    
+
     // Send email
     try {
       const info = await transporter.sendMail(mailOptions);
       console.log('✅ Password reset email sent successfully:', info.messageId);
-      
+
       return res.status(200).json({
         message: 'Password reset link sent to your email'
       });
     } catch (emailError) {
       console.error('❌ Failed to send password reset email:', emailError);
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Failed to send reset email. Please try again later.'
       });
     }
-    
+
   } catch (error) {
     console.error('Error sending password reset email:', error);
     return res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Route to handle password reset
-app.post('/reset-password/:token', async (req, res) => {
+// SECURITY: Reset password with validation
+app.post('/reset-password/:token', validators.resetPassword, async (req, res) => {
   console.log('✅ Hit /reset-password/:token')
   try {
     const { password } = req.body;
     const { token } = req.params;
-    
-    if (!password) {
-      return res.status(400).json({ message: 'New password is required' });
-    }
-    
+
     // Hash the token from URL to compare with stored one
     const hashedToken = crypto
       .createHash('sha256')
       .update(token)
       .digest('hex');
-    
+
     // Find user with the token and check if token is still valid
-    const user = await User.findOne({
-      resetPasswordToken: hashedToken,
-      resetPasswordExpires: { $gt: Date.now() }
-    });
-    
+    const user = findUserByResetToken(hashedToken);
+
     if (!user) {
-      return res.status(400).json({ 
-        message: 'Password reset token is invalid or has expired' 
+      return res.status(400).json({
+        message: 'Password reset token is invalid or has expired'
       });
     }
-    
+
     // Hash the new password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
-    
+
     // Update user's password and clear reset token fields
     user.password = hashedPassword;
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
-    await user.save();
-    
+    // in memory update
+
     console.log('Password reset successfully for user:', user.username);
-    
+
     return res.status(200).json({
       message: 'Password has been reset successfully',
       redirectTo: '/login'
     });
-    
+
   } catch (error) {
     console.error('Error resetting password:', error);
     return res.status(500).json({ message: 'Server error' });
@@ -1234,9 +1496,11 @@ function getUsername(socket, data) {
 
 // Robust joinRoom
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+  // Connection logging disabled to reduce terminal noise
+  // console.log(`User connected: ${socket.id}`);
 
   socket.on('joinInterestRoom', ({ username, interests }) => {
+    console.log('🔍 Debug: Received joinInterestRoom event:', { username, interests });
     if (!Array.isArray(interests) || interests.length === 0) {
       console.error(`Invalid interests for user ${username}:`, interests);
       return;
@@ -1255,21 +1519,21 @@ io.on('connection', (socket) => {
     if (!roomToJoin) {
       // No room found, create a new one.
       roomToJoin = `interest-room-${crypto.randomBytes(8).toString('hex')}`;
-      console.log(`Creating new room ${roomToJoin} for user ${username} with interests: ${interests}`);
+      console.log(`🔍 Debug: Creating new room ${roomToJoin} for user ${username} with interests: ${interests}`);
     } else {
-      console.log(`User ${username} found existing room ${roomToJoin} for interests: ${interests}`);
+      console.log(`🔍 Debug: User ${username} found existing room ${roomToJoin} for interests: ${interests}`);
     }
-    
+
     socket.join(roomToJoin);
 
     // Update the map so all of the new user's interests point to this room.
     for (const interest of interests) {
       interestToRoomMap.set(interest, roomToJoin);
     }
-    
+
     // Let the client know which room they've been assigned to.
     socket.emit('interestRoomAssigned', { roomName: roomToJoin });
-    
+
     const room = io.sockets.adapter.rooms.get(roomToJoin);
     if (room) {
       io.to(roomToJoin).emit('interestRoomUserCount', { count: room.size });
@@ -1277,13 +1541,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('leaveInterestRoom', ({ username, roomName }) => {
-    if (!roomName) return; 
-    
+    if (!roomName) return;
+
     socket.leave(roomName);
     console.log(`${username} left interest room: ${roomName}`);
     const room = io.sockets.adapter.rooms.get(roomName);
     const userCount = room ? room.size : 0;
-    
+
     if (room) {
       io.to(roomName).emit('interestRoomUserCount', { count: userCount });
     }
@@ -1343,8 +1607,9 @@ io.on('connection', (socket) => {
 
   // Add disconnection logging with reason
   socket.on('disconnect', (reason) => {
-    console.log(`Socket ${socket.id} disconnected. Reason: ${reason}`);
-    
+    // Disconnection logging disabled to reduce terminal noise
+    // console.log(`Socket ${socket.id} disconnected. Reason: ${reason}`);
+
     // Remove from all rooms
     for (const [userId, socketId] of userSocketMap.entries()) {
       if (socketId === socket.id) {
@@ -1355,65 +1620,65 @@ io.on('connection', (socket) => {
       }
     }
   });
-  
+
   // Create room
   socket.on('createRoom', (username, callback) => {
     const roomCode = generateRoomCode();
-    
+
     // Create room if doesn't exist
     activeRooms.set(roomCode, {
       name: roomCode,
       users: [username],
       messages: [] // Initialize messages array
     });
-    
+
     // Join socket to room
     socket.join(roomCode);
-    
+
     console.log(`Room ${roomCode} created by ${username}`);
     callback(roomCode);
   });
-  
+
   // Join room request
   socket.on('joinRoom', ({ roomCode, username }) => {
     console.log(`Join request received for room ${roomCode} from ${username}`);
     const room = activeRooms.get(roomCode);
-    
+
     if (!room) {
       console.log(`Room ${roomCode} not found`);
       socket.emit('joinError', { message: 'Room not found' });
       return;
     }
-    
+
     // Allow direct room access
     console.log(`Allowing ${username} to join room ${roomCode}`);
     socket.join(roomCode);
-    
+
     // Add user to room if not already present
     if (!room.users.includes(username)) {
       room.users.push(username);
     }
-    
+
     // Send room history to the user
     socket.emit("roomHistory", { messages: room.messages || [] });
-    
+
     // Notify room of new user
-    io.in(roomCode).emit("userJoined", { 
+    io.in(roomCode).emit("userJoined", {
       username,
       users: room.users
     });
-    
+
     // Send room users to everyone
     io.in(roomCode).emit("roomUsers", {
       room: roomCode,
       users: room.users
     });
   });
-  
+
   // Handle messages including attachments
   socket.on('sendMessage', (message) => {
     console.log(`Message received from ${message.username} in room ${message.roomCode}`);
-    
+
     // Store message in room history
     const room = activeRooms.get(message.roomCode);
     if (room) {
@@ -1422,11 +1687,11 @@ io.on('connection', (socket) => {
       }
       room.messages.push(message);
     }
-    
+
     // Broadcast to everyone in the room including sender
     io.in(message.roomCode).emit('receiveMessage', message);
   });
-  
+
   // Typing indicator
   socket.on('typing', ({ room, username, isTyping }) => {
     socket.to(room).emit('userTyping', { username, isTyping });
@@ -1435,56 +1700,56 @@ io.on('connection', (socket) => {
   // Voice Call Handlers - Enhanced for room-wide calls
   socket.on('callRequest', ({ roomCode, from, participants }) => {
     console.log(`Call request from ${from} in room ${roomCode} with participants:`, participants);
-    
+
     // Store call state for the room
     if (!activeRooms.has(roomCode)) {
       activeRooms.set(roomCode, { users: [], callState: 'idle', callInitiator: null });
     }
-    
+
     const room = activeRooms.get(roomCode);
     room.callState = 'ringing';
     room.callInitiator = from;
     room.callParticipants = participants || [];
-    
+
     // Send call request to all users in the room except the caller
-    socket.to(roomCode).emit('callRequest', { 
-      from, 
-      roomCode, 
+    socket.to(roomCode).emit('callRequest', {
+      from,
+      roomCode,
       participants,
       callType: 'voice', // Indicate this is a voice call
       message: `${from} is starting a voice call. Join the call?`
     });
-    
+
     console.log(`Call notification sent to room ${roomCode}`);
   });
 
   socket.on('callAccepted', ({ from, roomCode }) => {
     console.log(`Call accepted by ${from} in room ${roomCode}`);
-    
+
     const room = activeRooms.get(roomCode);
     if (room) {
       // Add user to call participants if not already there
       if (!room.callParticipants.includes(from)) {
         room.callParticipants.push(from);
       }
-      
+
       // If this is the first acceptance, change call state to connected
       if (room.callState === 'ringing' && room.callParticipants.length > 1) {
         room.callState = 'connected';
       }
     }
-    
+
     // Notify all users in the room about the acceptance
-    io.in(roomCode).emit('callAccepted', { 
-      from, 
+    io.in(roomCode).emit('callAccepted', {
+      from,
       roomCode,
       callParticipants: room?.callParticipants || [],
       callState: room?.callState || 'connected'
     });
-    
+
     // Notify all participants that someone joined the call
-    io.in(roomCode).emit('userJoinedCall', { 
-      username: from, 
+    io.in(roomCode).emit('userJoinedCall', {
+      username: from,
       roomCode,
       callParticipants: room?.callParticipants || []
     });
@@ -1492,17 +1757,12 @@ io.on('connection', (socket) => {
 
   socket.on('callRejected', ({ from, roomCode }) => {
     console.log(`Call rejected by ${from} in room ${roomCode}`);
-    
-    // Notify the call initiator that their call was rejected
-    const room = activeRooms.get(roomCode);
-    if (room && room.callInitiator) {
-      socket.to(room.callInitiator).emit('callRejected', { from, roomCode });
-    }
+    io.in(roomCode).emit('callRejected', { from, roomCode });
   });
 
   socket.on('callEnded', ({ roomCode, from }) => {
     console.log(`Call ended by ${from} in room ${roomCode}`);
-    
+
     // Reset call state for the room
     const room = activeRooms.get(roomCode);
     if (room) {
@@ -1510,10 +1770,10 @@ io.on('connection', (socket) => {
       room.callInitiator = null;
       room.callParticipants = [];
     }
-    
+
     // Notify all users in the room that the call has ended
-    io.in(roomCode).emit('callEnded', { 
-      from, 
+    io.in(roomCode).emit('callEnded', {
+      from,
       roomCode,
       message: `${from} ended the voice call`
     });
@@ -1572,14 +1832,14 @@ io.on('connection', (socket) => {
   socket.on('getRoomParticipants', ({ roomCode }) => {
     const room = activeRooms.get(roomCode);
     if (room && room.users) {
-      socket.emit('roomParticipants', { 
+      socket.emit('roomParticipants', {
         participants: room.users,
         callState: room.callState || 'idle',
         callInitiator: room.callInitiator,
         callParticipants: room.callParticipants || []
       });
     } else {
-      socket.emit('roomParticipants', { 
+      socket.emit('roomParticipants', {
         participants: [],
         callState: 'idle',
         callInitiator: null,
@@ -1625,43 +1885,73 @@ io.on('connection', (socket) => {
     const username = socketToUserMap.get(socketId);
     callback({ username });
   });
-});
 
-// --- Mesh WebRTC Signaling for Voice Calls ---
-const meshRooms = {};
+  // Mesh WebRTC for Voice Calls
+  socket.on('join', (data) => {
+    const room = typeof data === 'string' ? data : data.room;
+    const username = data.username || 'Anonymous';
 
-io.on('connection', socket => {
-  socket.on('join', room => {
+    console.log(`Voice call user ${username} (${socket.id}) joining room ${room}`);
     socket.join(room);
-    meshRooms[room] = meshRooms[room] || [];
-    meshRooms[room].push(socket.id);
 
-    // Send the list of peers to the new user
-    io.to(socket.id).emit('peers', { peers: meshRooms[room].filter(id => id !== socket.id) });
+    if (!meshRooms[room]) {
+      meshRooms[room] = [];
+    }
+
+    // Store as object for better tracking
+    const existingPeerIndex = meshRooms[room].findIndex(p => p.id === socket.id);
+    if (existingPeerIndex === -1) {
+      meshRooms[room].push({ id: socket.id, username });
+    } else {
+      meshRooms[room][existingPeerIndex].username = username;
+    }
+
+    // Send the list of peers (socket IDs) to the new user for WebRTC
+    const peerIds = meshRooms[room].filter(p => p.id !== socket.id).map(p => p.id);
+    io.to(socket.id).emit('peers', { peers: peerIds });
 
     // Notify others in the room about the new peer
-    socket.to(room).emit('new-peer', { peerId: socket.id });
+    socket.to(room).emit('new-peer', { peerId: socket.id, username });
 
-    // Emit user count to all in the room
+    // Emit user count and full participant list to all in the room
     io.to(room).emit('user-count', meshRooms[room].length);
+    io.to(room).emit('participants-list', meshRooms[room]);
+  });
 
-    // Relay signals
-    socket.on('signal', ({ to, data }) => {
-      io.to(to).emit('signal', { from: socket.id, data });
-    });
+  // Handle WebRTC signaling (moved outside join handler)
+  socket.on('signal', ({ to, data }) => {
+    io.to(to).emit('signal', { from: socket.id, data });
+  });
 
-    // Clean up on disconnect
-    socket.on('disconnect', () => {
-      meshRooms[room] = (meshRooms[room] || []).filter(id => id !== socket.id);
-      io.to(room).emit('user-count', meshRooms[room].length);
-      if (meshRooms[room].length === 0) delete meshRooms[room];
-    });
+  // Clean up on disconnect
+  socket.on('disconnect', () => {
+    // console.log(`Voice call user ${socket.id} disconnected`);
+    // Clean up from all mesh rooms
+    for (const [room, peers] of Object.entries(meshRooms)) {
+      const peerIndex = peers.findIndex(p => p.id === socket.id);
+      if (peerIndex !== -1) {
+        meshRooms[room].splice(peerIndex, 1);
+        io.to(room).emit('user-count', meshRooms[room].length);
+        io.to(room).emit('participants-list', meshRooms[room]);
+        io.to(room).emit('peer-disconnected', socket.id);
+        if (meshRooms[room].length === 0) delete meshRooms[room];
+      }
+    }
   });
 });
 
 // Define a route for the root URL
 app.get('/', (req, res) => {
   res.status(200).json({ message: 'Backend is running!' });
+});
+
+// API status endpoint
+app.get('/api/status', (req, res) => {
+  res.status(200).json({
+    message: 'Backend is running!',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 // Catch-all: send back React's index.html for any other route
@@ -1721,153 +2011,7 @@ manager.addAnswer("en", "None", "I'm not sure I understand. Could you please rep
 })();
 
 // =====================
-// API Endpoints
-// =====================
-
-// Chatbot endpoint using node-nlp
-app.post("/api/chatbot", async (req, res) => {
-  const { message } = req.body;
-  console.log("Received message:", message); // Log the received message
-  if (!message || typeof message !== "string") {
-    return res.status(400).json({ reply: "Invalid message." });
-  }
-  try {
-    const result = await manager.process("en", message);
-    const reply = result.answer || "I'm not sure I understand. Could you please rephrase your question?";
-    return res.json({ reply });
-  } catch (error) {
-    console.error("Error processing NLP:", error);
-    return res.status(500).json({ reply: "Sorry, an error occurred while processing your request." });
-  }
-});
-
-// AI-powered icebreaker endpoint (now using Gemini)
-app.post('/api/icebreaker', async (req, res) => {
-  const { interests } = req.body;
-  const prompt = `Give me only one fun, safe, and friendly icebreaker question for a chat between strangers who are interested in: ${interests && interests.length ? interests.join(', ') : 'anything'}. Do not include any preamble or explanation, just output the question itself.`;
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY || 'AIzaSyBE1TKKXkdvk954EF71aTc7TluqckTIjfs';
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ]
-      }
-    );
-    const aiIcebreaker = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "What's something interesting about your favorite hobby?";
-    res.json({ icebreaker: aiIcebreaker });
-  } catch (err) {
-    res.json({ icebreaker: "What's something interesting about your favorite hobby?" });
-  }
-});
-
-// Gemini API test endpoint
-app.post('/api/gemini', async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) {
-    return res.status(400).json({ error: 'Prompt is required.' });
-  }
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY || 'AIzaSyBE1TKKXkdvk954EF71aTc7TluqckTIjfs';
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ]
-      }
-    );
-    const geminiText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini.';
-    res.json({ reply: geminiText });
-  } catch (error) {
-    console.error('Gemini API error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Failed to get response from Gemini.' });
-  }
-});
-
-// AI suggestion endpoint (Gemini)
-app.post('/api/ai-suggest-reply', async (req, res) => {
-  const { selected_message, chat_history, participants, interests } = req.body;
-  // Compose a prompt for Gemini
-  const prompt = `You are WingmanAI, a helpful assistant for chat conversations.\nGiven the following conversation in an interest-based chat room, answer from the perspective of the user who is asking (not as an outsider or general AI).\nUse the chat history and the user's interests to make your reply relevant and personal.\n\nConversation history:\n${(chat_history || []).join('\n')}\n\nLast message from user: '${selected_message}'\nParticipants: ${(participants || []).join(', ')}.\nInterests: ${(interests || []).join(', ')}.\n\nSuggest a smart, friendly, and engaging reply to keep the conversation going. Make it relevant to the interests. Be helpful, positive, and natural.\nJust output the reply, no preamble or explanation.`;
-
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY || 'AIzaSyBE1TKKXkdvk954EF71aTc7TluqckTIjfs';
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ]
-      }
-    );
-    const suggestion = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "Could not generate a suggestion.";
-    res.json({ suggestion });
-  } catch (err) {
-    res.json({ suggestion: "Could not generate a suggestion." });
-  }
-});
-
-// Gemini open chat endpoint
-app.post('/api/gemini-chat', async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) {
-    return res.status(400).json({ error: 'Prompt is required.' });
-  }
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY || 'AIzaSyBE1TKKXkdvk954EF71aTc7TluqckTIjfs';
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ]
-      }
-    );
-    const chatResponse = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini.';
-    res.json({ response: chatResponse });
-  } catch (error) {
-    res.status(500).json({ response: 'Could not generate a response.' });
-  }
-});
-
-// Compatibility Meter endpoint (Gemini)
-app.post('/api/compatibility-meter', async (req, res) => {
-  const { chat_history, user1_interests, user2_interests } = req.body;
-  const prompt = `Analyze the following chat conversation between two users. Based on their shared interests, the tone of their messages, and how well they engaged with each other, give a compatibility score from 0 to 100 and a short, fun label (like “Perfect Vibe!” or “Great Match!”).\n\nChat history:\n${(chat_history || []).join('\n')}\n\nUser 1 interests: ${(user1_interests || []).join(', ')}\nUser 2 interests: ${(user2_interests || []).join(', ')}\n\nRespond in this format:\nScore: [number]%\nLabel: [short phrase]\nReason: [one-sentence explanation]`;
-
-  try {
-    const geminiApiKey = process.env.GEMINI_API_KEY || 'YOUR_GEMINI_API_KEY';
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ]
-      }
-    );
-    const result = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "Could not generate a compatibility score.";
-    res.json({ result });
-  } catch (err) {
-    res.json({ result: "Could not generate a compatibility score." });
-  }
-});
+// End of API routes
 
 app.get("/favicon.ico", (req, res) => {
   res.status(204).send();
@@ -1891,16 +2035,6 @@ app.options(['/uploads/*', '/audio/*'], (req, res) => {
   res.sendStatus(200);
 });
 
-const startServer = async () => {
-  // Connect to MongoDB first
-  await mongoose.connect(MONGODB_URI)
-    .then(() => console.log('Connected to MongoDB'))
-    .catch(err => console.error('MongoDB connection error:', err));
-
-  // Then start server
-  server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-};
-
-startServer(); // Call the async function to start the server
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 export default app;

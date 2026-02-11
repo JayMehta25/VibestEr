@@ -200,6 +200,34 @@ function setupSocket(server) {
     });
 
     // WebRTC Signaling Handlers
+    socket.on('signal', ({ to, data }) => {
+      console.log(`WebRTC signal from ${socket.id} to ${to}`, data);
+      const targetSocket = io.sockets.sockets.get(to);
+      if (targetSocket) {
+        targetSocket.emit('signal', { from: socket.id, data });
+      }
+    });
+
+    socket.on('join', (room) => {
+      console.log(`User ${socket.id} joining room ${room}`);
+      socket.join(room);
+      socket.room = room;
+      
+      // Get all users in the room
+      const roomSockets = io.sockets.adapter.rooms.get(room);
+      if (roomSockets) {
+        const users = Array.from(roomSockets).filter(id => id !== socket.id);
+        socket.emit('all-users', users);
+        
+        // Notify other users about the new user
+        socket.to(room).emit('user-joined', socket.id);
+        
+        // Send user count to all users in the room
+        const userCount = roomSockets.size;
+        io.to(room).emit('user-count', userCount);
+      }
+    });
+
     socket.on('offer', ({ to, offer }) => {
       console.log(`WebRTC offer from ${socket.id} to ${to}`);
       const targetSocket = io.sockets.sockets.get(to);
@@ -420,6 +448,18 @@ function setupSocket(server) {
     socket.on('disconnect', () => {
       try {
         console.log('Client disconnected');
+        
+        // Handle voice call cleanup
+        if (socket.room) {
+          socket.to(socket.room).emit('user-left', socket.id);
+          
+          // Update user count for remaining users
+          const roomSockets = io.sockets.adapter.rooms.get(socket.room);
+          if (roomSockets) {
+            const userCount = roomSockets.size;
+            io.to(socket.room).emit('user-count', userCount);
+          }
+        }
         
         // Handle user leaving rooms
         const roomCode = socket.roomCode;

@@ -4,10 +4,16 @@ import dotenv from 'dotenv';
 // Load environment variables from .env file
 dotenv.config();
 
-const connectDB = async () => {
+// Accept URI explicitly so callers can provide a fallback when env is missing
+const connectDB = async (uri) => {
   try {
+    const mongoUri = uri || process.env.MONGODB_URI;
+    if (!mongoUri) {
+      throw new Error('MONGODB_URI is not set. Provide it via .env or pass it to connectDB(uri).');
+    }
+
     // Modern Mongoose (v6+) doesn't need the options
-    await mongoose.connect(process.env.MONGODB_URI);
+    await mongoose.connect(mongoUri);
     console.log('Connected to MongoDB');
 
     // Optional: Add connection event listeners
