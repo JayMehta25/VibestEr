@@ -76,7 +76,8 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // Trust proxy - required for rate limiting behind reverse proxies
-app.enable('trust proxy');
+// Set to 1 for Render (single proxy layer) to avoid rate limiting bypass
+app.set('trust proxy', 1);
 
 // Rate Limiting: Global rate limiter for all requests
 const globalLimiter = rateLimit(globalRateLimitConfig);
@@ -320,7 +321,6 @@ dotenv.config();
 // A map from an interest to the room that serves it.
 const interestToRoomMap = new Map();
 
-app.enable('trust proxy');
 io.engine.on("initial_headers", (headers, req) => {
   const origin = req.headers.origin;
   if (origin) {
