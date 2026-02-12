@@ -14,11 +14,6 @@ function setupSocket(server) {
   io.on('connection', (socket) => {
     console.log('New client connected');
 
-    // Broadcast updated online user count to all clients
-    const onlineUsers = io.sockets.sockets.size;
-    io.emit('onlineUsersUpdate', onlineUsers);
-    console.log(`Online users: ${onlineUsers}`);
-
     // Handle background changes
     socket.on('changeBackground', ({ roomCode, backgroundImage }) => {
       try {
@@ -453,13 +448,6 @@ function setupSocket(server) {
     socket.on('disconnect', () => {
       try {
         console.log('Client disconnected');
-
-        // Broadcast updated online user count to all remaining clients
-        setTimeout(() => {
-          const onlineUsers = io.sockets.sockets.size;
-          io.emit('onlineUsersUpdate', onlineUsers);
-          console.log(`Online users after disconnect: ${onlineUsers}`);
-        }, 100);
 
         // Handle voice call cleanup
         if (socket.room) {
