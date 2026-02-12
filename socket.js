@@ -14,6 +14,11 @@ function setupSocket(server) {
   io.on('connection', (socket) => {
     console.log('New client connected');
 
+    // Broadcast updated online user count to all clients
+    const onlineUsers = io.sockets.sockets.size;
+    io.emit('onlineUsersUpdate', onlineUsers);
+    console.log(`Online users: ${onlineUsers}`);
+
     // Handle background changes
     socket.on('changeBackground', ({ roomCode, backgroundImage }) => {
       try {
@@ -209,7 +214,7 @@ function setupSocket(server) {
     });
 
     socket.on('join', (room) => {
-      console.log(`User ${socket.id} joining room ${room}`);
+      console.log(`User ${socket.id} joining voice room ${room}`);
       socket.join(room);
       socket.room = room;
 
@@ -217,14 +222,18 @@ function setupSocket(server) {
       const roomSockets = io.sockets.adapter.rooms.get(room);
       if (roomSockets) {
         const users = Array.from(roomSockets).filter(id => id !== socket.id);
-        socket.emit('all-users', users);
 
-        // Notify other users about the new user
-        socket.to(room).emit('user-joined', socket.id);
+        // Emit 'peers' event that VoiceCall.js expects
+        socket.emit('peers', { peers: users });
+
+        // Notify other users about the new peer
+        socket.to(room).emit('new-peer', { peerId: socket.id });
 
         // Send user count to all users in the room
         const userCount = roomSockets.size;
         io.to(room).emit('user-count', userCount);
+
+        console.log(`User ${socket.id} joined voice room ${room} with ${users.length} existing peers`);
       }
     });
 
@@ -451,7 +460,8 @@ function setupSocket(server) {
 
         // Handle voice call cleanup
         if (socket.room) {
-          socket.to(socket.room).emit('user-left', socket.id);
+          // Emit 'peer-disconnected' for VoiceCall.js
+          socket.to(socket.room).emit('peer-disconnected', socket.id);
 
           // Update user count for remaining users
           const roomSockets = io.sockets.adapter.rooms.get(socket.room);
