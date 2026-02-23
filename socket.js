@@ -204,62 +204,9 @@ function setupSocket(server) {
       }
     });
 
-    // WebRTC Signaling Handlers
-    socket.on('signal', ({ to, data }) => {
-      console.log(`WebRTC signal from ${socket.id} to ${to}`, data);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit('signal', { from: socket.id, data });
-      }
-    });
-
-    socket.on('join', (room) => {
-      console.log(`User ${socket.id} joining voice room ${room}`);
-      socket.join(room);
-      socket.room = room;
-
-      // Get all users in the room
-      const roomSockets = io.sockets.adapter.rooms.get(room);
-      if (roomSockets) {
-        const users = Array.from(roomSockets).filter(id => id !== socket.id);
-
-        // Emit 'peers' event that VoiceCall.js expects
-        socket.emit('peers', { peers: users });
-
-        // Notify other users about the new peer
-        socket.to(room).emit('new-peer', { peerId: socket.id });
-
-        // Send user count to all users in the room
-        const userCount = roomSockets.size;
-        io.to(room).emit('user-count', userCount);
-
-        console.log(`User ${socket.id} joined voice room ${room} with ${users.length} existing peers`);
-      }
-    });
-
-    socket.on('offer', ({ to, offer }) => {
-      console.log(`WebRTC offer from ${socket.id} to ${to}`);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit('offer', { from: socket.id, offer });
-      }
-    });
-
-    socket.on('answer', ({ to, answer }) => {
-      console.log(`WebRTC answer from ${socket.id} to ${to}`);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit('answer', { from: socket.id, answer });
-      }
-    });
-
-    socket.on('iceCandidate', ({ to, candidate }) => {
-      console.log(`ICE candidate from ${socket.id} to ${to}`);
-      const targetSocket = io.sockets.sockets.get(to);
-      if (targetSocket) {
-        targetSocket.emit('iceCandidate', { from: socket.id, candidate });
-      }
-    });
+    // NOTE: WebRTC signaling handlers (join, signal, offer, answer, iceCandidate)
+    // are handled in server.js which has better peer tracking via meshRooms.
+    // Do NOT add duplicate handlers here.
 
     // Call management handlers
     socket.on('callRequest', ({ roomCode, from, participants, message }) => {
