@@ -16,8 +16,14 @@ function setupSocket(server) {
 
     // Broadcast updated online user count to all clients
     const onlineUsers = io.sockets.sockets.size;
-    io.emit('onlineUsersUpdate', onlineUsers);
+    io.emit('totalOnlineUsers', { count: onlineUsers });
     console.log(`Online users: ${onlineUsers}`);
+
+    // Handle request for current online count
+    socket.on('getOnlineCount', () => {
+      const count = io.sockets.sockets.size;
+      socket.emit('totalOnlineUsers', { count });
+    });
 
     // Handle background changes
     socket.on('changeBackground', ({ roomCode, backgroundImage }) => {
@@ -447,6 +453,10 @@ function setupSocket(server) {
       } catch (error) {
         console.error('Error handling disconnect:', error);
       }
+
+      // Broadcast updated count to all remaining clients
+      const updatedCount = io.sockets.sockets.size;
+      io.emit('totalOnlineUsers', { count: updatedCount });
     });
   });
 
