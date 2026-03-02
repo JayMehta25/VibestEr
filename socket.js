@@ -10,6 +10,7 @@ function setupSocket(server) {
 
   const rooms = new Map();
   const callStates = new Map(); // Track call states per room
+  const userSockets = new Map(); // Map: username -> socket.id
 
   io.on('connection', (socket) => {
     console.log('New client connected');
@@ -383,6 +384,7 @@ function setupSocket(server) {
     socket.on('register', (username) => {
       console.log(`User ${username} registered with socket ${socket.id}`);
       socket.username = username;
+      userSockets.set(username, socket.id);
     });
 
     // Typing indicator
@@ -407,9 +409,20 @@ function setupSocket(server) {
       }
     });
 
+    // Friend Request Logic
+    socket.on('sendFriendRequest', ({ to, from }) => {
+      const targetSocketId = userSockets.get(to);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('incomingFriendRequest', { from });
+      }
+    });
+
     socket.on('disconnect', () => {
       try {
         console.log('Client disconnected');
+        if (socket.username) {
+          userSockets.delete(socket.username);
+        }
 
         // Handle voice call cleanup
         if (socket.room) {
