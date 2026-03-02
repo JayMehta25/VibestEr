@@ -417,6 +417,13 @@ function setupSocket(server) {
       }
     });
 
+    socket.on('dashboardMessage', ({ to, from, content }) => {
+      const targetSocketId = userSockets.get(to);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('incomingDashboardMessage', { from, content, sent_at: new Date().toISOString() });
+      }
+    });
+
     socket.on('getOnlineUsers', () => {
       socket.emit('onlineUsersList', Array.from(userSockets.keys()));
     });
