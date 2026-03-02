@@ -382,9 +382,12 @@ function setupSocket(server) {
 
     // Register user
     socket.on('register', (username) => {
+      if (!username) return;
       console.log(`User ${username} registered with socket ${socket.id}`);
       socket.username = username;
       userSockets.set(username, socket.id);
+      // Broadcast updated online list to ALL clients immediately
+      io.emit('onlineUsersList', Array.from(userSockets.keys()));
     });
 
     // Typing indicator
@@ -414,13 +417,18 @@ function setupSocket(server) {
       const targetSocketId = userSockets.get(to);
       if (targetSocketId) {
         io.to(targetSocketId).emit('incomingFriendRequest', { from });
+      } else {
+        console.log(`[sendFriendRequest] User "${to}" not online, skipping.`);
       }
     });
 
     socket.on('dashboardMessage', ({ to, from, content }) => {
       const targetSocketId = userSockets.get(to);
       if (targetSocketId) {
+        console.log(`[dashboardMessage] Delivering from "${from}" to "${to}" (socket: ${targetSocketId})`);
         io.to(targetSocketId).emit('incomingDashboardMessage', { from, content, sent_at: new Date().toISOString() });
+      } else {
+        console.log(`[dashboardMessage] User "${to}" not online/registered. Online users: [${Array.from(userSockets.keys()).join(', ')}]`);
       }
     });
 
@@ -430,9 +438,11 @@ function setupSocket(server) {
 
     socket.on('disconnect', () => {
       try {
-        console.log('Client disconnected');
+        console.log(`Client disconnected: ${socket.username || socket.id}`);
         if (socket.username) {
           userSockets.delete(socket.username);
+          // Broadcast updated online list so friends see the change immediately
+          io.emit('onlineUsersList', Array.from(userSockets.keys()));
         }
 
         // Handle voice call cleanup
