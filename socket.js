@@ -417,6 +417,10 @@ function setupSocket(server) {
       }
     });
 
+    socket.on('getOnlineUsers', () => {
+      socket.emit('onlineUsersList', Array.from(userSockets.keys()));
+    });
+
     socket.on('disconnect', () => {
       try {
         console.log('Client disconnected');
