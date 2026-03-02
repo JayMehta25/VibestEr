@@ -383,9 +383,10 @@ function setupSocket(server) {
     // Register user
     socket.on('register', (username) => {
       if (!username) return;
-      console.log(`User ${username} registered with socket ${socket.id}`);
-      socket.username = username;
-      userSockets.set(username, socket.id);
+      const key = username.toLowerCase();
+      console.log(`User ${username} (key: ${key}) registered with socket ${socket.id}`);
+      socket.username = key;
+      userSockets.set(key, socket.id);
       // Broadcast updated online list to ALL clients immediately
       io.emit('onlineUsersList', Array.from(userSockets.keys()));
     });
@@ -414,7 +415,7 @@ function setupSocket(server) {
 
     // Friend Request Logic
     socket.on('sendFriendRequest', ({ to, from }) => {
-      const targetSocketId = userSockets.get(to);
+      const targetSocketId = userSockets.get(to.toLowerCase());
       if (targetSocketId) {
         io.to(targetSocketId).emit('incomingFriendRequest', { from });
       } else {
@@ -423,7 +424,7 @@ function setupSocket(server) {
     });
 
     socket.on('dashboardMessage', ({ to, from, content }) => {
-      const targetSocketId = userSockets.get(to);
+      const targetSocketId = userSockets.get(to.toLowerCase());
       if (targetSocketId) {
         console.log(`[dashboardMessage] Delivering from "${from}" to "${to}" (socket: ${targetSocketId})`);
         io.to(targetSocketId).emit('incomingDashboardMessage', { from, content, sent_at: new Date().toISOString() });
