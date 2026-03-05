@@ -129,6 +129,48 @@ app.get('/api/ping', (req, res) => {
   res.json({ message: 'pong', timestamp: new Date().toISOString() });
 });
 
+// ==========================================
+// DELETE MESSAGES ENDPOINT (bypasses RLS via service role key)
+// ==========================================
+app.post('/api/delete-messages', async (req, res) => {
+  const { userA, userB } = req.body;
+  if (!userA || !userB) {
+    return res.status(400).json({ error: 'userA and userB are required' });
+  }
+
+  const supabaseUrl = process.env.REACT_APP_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!serviceKey) {
+    console.error('[delete-messages] SUPABASE_SERVICE_ROLE_KEY not set in .env');
+    return res.status(500).json({ error: 'Server not configured for message deletion' });
+  }
+
+  const headers = {
+    'apikey': serviceKey,
+    'Authorization': `Bearer ${serviceKey}`,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=minimal',
+  };
+
+  try {
+    // Delete messages from userA → userB
+    await axios.delete(
+      `${supabaseUrl}/rest/v1/messages?sender_username=eq.${encodeURIComponent(userA)}&receiver_username=eq.${encodeURIComponent(userB)}`,
+      { headers }
+    );
+    // Delete messages from userB → userA
+    await axios.delete(
+      `${supabaseUrl}/rest/v1/messages?sender_username=eq.${encodeURIComponent(userB)}&receiver_username=eq.${encodeURIComponent(userA)}`,
+      { headers }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[delete-messages] Error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to delete messages', detail: err.response?.data });
+  }
+});
+
 app.options(['/api/icebreaker', '/api/ai-suggest-reply', '/api/gemini', '/api/gemini-chat', '/api/compatibility-meter', '/api/gemini-status'], (req, res) => {
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
