@@ -171,7 +171,7 @@ app.post('/api/delete-messages', async (req, res) => {
   }
 });
 
-app.options(['/api/icebreaker', '/api/ai-suggest-reply', '/api/gemini', '/api/gemini-chat', '/api/compatibility-meter', '/api/gemini-status'], (req, res) => {
+app.options(['/api/icebreaker', '/api/ai-suggest-reply', '/api/gemini', '/api/gemini-chat', '/api/compatibility-meter', '/api/gemini-status', '/api/delete-messages'], (req, res) => {
   const origin = req.headers.origin || '*';
   res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
