@@ -1,7 +1,7 @@
-import { Server } from 'socket.io';
+const socketIo = require('socket.io');
 
-export function setupSocket(server) {
-  const io = new Server(server, {
+function setupSocket(server) {
+  const io = socketIo(server, {
     cors: {
       origin: '*',
       methods: ['GET', 'POST']
@@ -498,4 +498,4 @@ export function setupSocket(server) {
   return io;
 }
 
-export default setupSocket;
+module.exports = setupSocket; 
