@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config(); // Load once at the start
 import crypto from 'crypto';
 // No DB connector needed
 import pkg from 'node-nlp'; // Import the entire package
@@ -22,6 +22,7 @@ import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 import { v4 as uuidv4 } from 'uuid';
 import timeout from 'connect-timeout';
+import { setupSocket } from './socket.js';
 
 // ==========================================
 // SECURITY IMPORTS - OWASP Best Practices
@@ -60,56 +61,48 @@ try {
 // ==========================================
 // EXPRESS APP INITIALIZATION
 // ==========================================
+// SECURITY MIDDLEWARE
 const app = express();
+const server = http.createServer(app); // Create HTTP server
+// Socket initialization
+setupSocket(server);
 
-// ==========================================
-// SECURITY MIDDLEWARE - Applied First
-// ==========================================
-
-// Helmet: Set security headers (OWASP recommended)
-// ONLY enabled in production to allow ngrok and development tools to work
-if (process.env.NODE_ENV === 'production') {
-  app.use(helmet(helmetConfig));
-  console.log('✅ Helmet security headers enabled (production mode)');
-} else {
-  console.log('⚠️  Helmet security headers disabled (development mode)');
-}
-
-// Trust proxy - required for rate limiting behind reverse proxies
-// Set to 1 for Render (single proxy layer) to avoid rate limiting bypass
+app.use(helmet(helmetConfig));
 app.set('trust proxy', 1);
-
-// Rate Limiting: Global rate limiter for all requests
-const globalLimiter = rateLimit(globalRateLimitConfig);
-app.use(globalLimiter);
-
-// Body parser with size limits to prevent DoS
-app.use(bodyParser.json({ limit: '1mb' })); // Reduced from 50mb for security
+app.use(rateLimit(globalRateLimitConfig));
+app.use(bodyParser.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-
-// Data sanitization against NoSQL injection
 app.use(mongoSanitize());
-
-// Data sanitization against XSS
 app.use(xss());
 
-// DEBUG LOGGER: See all incoming requests
+// Logger
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
-// --- AI & Interest Chat Middleware ---
+// Unified CORS
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin ||
+      origin === 'http://localhost:3000' ||
+      origin.includes('ngrok') ||
+      origin.includes('vibester.me') ||
+      origin.includes('vercel.app') ||
+      origin.includes('onrender.com')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin', 'Range']
+}));
+
+// Route-specific middleware
 const icebreakerCors = (req, res, next) => {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
+  next(); // CORS is now handled globally
 };
 
 // ==========================================
@@ -171,15 +164,7 @@ app.post('/api/delete-messages', async (req, res) => {
   }
 });
 
-app.options(['/api/icebreaker', '/api/ai-suggest-reply', '/api/gemini', '/api/gemini-chat', '/api/compatibility-meter', '/api/gemini-status', '/api/delete-messages'], (req, res) => {
-  const origin = req.headers.origin || '*';
-  res.setHeader('Access-Control-Allow-Origin', origin);
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  return res.sendStatus(200);
-});
+// Options handled by global CORS
 
 // SECURITY: AI Icebreaker endpoint with rate limiting and validation
 app.post('/api/icebreaker', aiLimiter, icebreakerCors, validators.icebreaker, async (req, res) => {
@@ -280,92 +265,7 @@ app.post('/api/compatibility-meter', aiLimiter, icebreakerCors, async (req, res)
   }
 });
 
-// This ensures all responses have the correct CORS headers for uploads, audio, and any other resource
-// (app = express() already declared above)
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  // Allow localhost, ngrok, and production domains
-  if (origin && (
-    origin === 'http://localhost:3000' ||
-    origin.includes('ngrok-free.app') ||
-    origin.includes('ngrok.io') ||
-    origin.includes('vibester.me') ||
-    origin.includes('vercel.app') ||
-    origin.includes('onrender.com')
-  )) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
-
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
-  res.setHeader('Accept-Ranges', 'bytes');
-  next();
-});
-
-// Serve static files from the React app build directory
-app.use(express.static(path.join(__dirname, 'client/build')));
-// Allow CORS for localhost:3000 and any ngrok URL
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin ||
-      origin === 'http://localhost:3000' ||
-      origin.includes('ngrok-free.app') ||
-      origin.includes('ngrok.io') ||
-      origin.includes('vibester.me') ||
-      origin.includes('vercel.app') ||
-      origin.includes('onrender.com')) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true
-}));
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: (origin, callback) => {
-      if (!origin ||
-        origin === 'http://localhost:3000' ||
-        origin.includes('ngrok-free.app') ||
-        origin.includes('ngrok.io') ||
-        origin.includes('vibester.me') ||
-        origin.includes('vercel.app') ||
-        origin.includes('onrender.com')) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS'));
-      }
-    },
-    methods: ["GET", "POST"],
-    credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin"]
-  },
-  transports: ['websocket', 'polling'],
-  path: '/socket.io/'
-});
-
-// CORS configuration (allow localhost, ngrok, and production domains)
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin ||
-      origin === 'http://localhost:3000' ||
-      origin.includes('ngrok-free.app') ||
-      origin.includes('ngrok.io') ||
-      origin.includes('vibester.me') ||
-      origin.includes('vercel.app') ||
-      origin.includes('onrender.com')) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'Origin']
-}));
+// Redundant CORS and static configuration removed
 
 const { NlpManager } = pkg; // Destructure to get NlpManager
 
@@ -382,42 +282,8 @@ io.engine.on("initial_headers", (headers, req) => {
   }
 });
 
-// Function to generate a unique room code
-const generateRoomCode = () => {
-  return Math.random().toString(36).substring(2, 8); // Generates a random string of 6 characters
-};
-const allowedOrigins = [
-  'http://localhost:3000',
-  // /https:\/\/(.*\.)?chatroullete-x-frontend-stage-7\.vercel\.app/,
-  // 'https://chatroullete-x-frontend.vercel.app' // Your production domain
-];
-// Initialize socket.io with CORS and buffer size for attachments
-
-
-// Server setup (no database)
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'Xn2r5u8x/A?D(G+KbPeShVmYp3s6v9y$';
-
-// Load environment variables
-console.log('- GEMINI_API_KEY exists:', !!process.env.GEMINI_API_KEY);
-if (process.env.GEMINI_API_KEY) {
-  console.log('- GEMINI_API_KEY starts with:', process.env.GEMINI_API_KEY.substring(0, 4) + '...');
-} else {
-  console.warn('WARNING: GEMINI_API_KEY is not defined in .env! Using potential hardcoded fallbacks.');
-}
-// In-memory user store (volatile; cleared on server restart)
-const users = [];
-
-const findUserByEmail = (email) => users.find(u => u.email === email);
-const findUserByVerificationToken = (token) => users.find(u => u.verificationToken === token);
-const findUserByResetToken = (hashedToken) => users.find(u => u.resetPasswordToken === hashedToken && u.resetPasswordExpires > Date.now());
-
-// Maps for active users and rooms
-const userSocketMap = new Map();
-const socketToUserMap = new Map(); // Map socket ID to username
-const activeRooms = new Map();
-const waitingUsersByInterest = new Map();
-const meshRooms = {}; // For voice call mesh networking
+// Server state
+const serverStatus = "Vibester Server Operational";
 
 
 // Add a timeout middleware for uploads and API requests
@@ -1015,393 +881,7 @@ app.get('/verify/:token', cors({
   res.send('Email verified successfully! You can now log in.');
 });
 
-// SECURITY: Send verification OTP with rate limiting and validation
-app.post('/send-verification-otp', authLimiter, validators.sendOtp, async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    console.log('Sending verification OTP to:', email);
-
-    // Find the user by email
-    const user = findUserByEmail(email);
-
-    if (!user) {
-      console.log('User not found for email:', email);
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    // Generate a 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    console.log('Generated OTP:', otp);
-
-    // Store OTP in user record
-    user.verificationToken = otp;
-    user.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-    // in memory update
-
-    // IMPORTANT: Check that credentials exist and log them (securely)
-    const emailUser = process.env.EMAIL_USER;
-    const emailPass = process.env.EMAIL_PASS;
-
-    console.log('Email credentials check:');
-    console.log('- Username provided:', emailUser ? 'YES' : 'NO');
-    console.log('- Password provided:', emailPass ? 'YES' : 'NO');
-
-    if (!emailUser || !emailPass) {
-      console.error('❌ EMAIL CREDENTIALS NOT PROVIDED - Check your .env file');
-      return res.status(500).json({
-        message: 'Email service configuration error. Please contact support.'
-      });
-    }
-
-    // Create transporter with explicit credentials
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: emailUser,
-        pass: emailPass
-      },
-      debug: true // Enable debugging output
-    });
-
-    // Verify the connection configuration
-    try {
-      await transporter.verify();
-      console.log('✅ SMTP connection verified successfully');
-    } catch (verifyError) {
-      console.error('❌ SMTP verification failed:', verifyError);
-      return res.status(500).json({
-        message: 'Email service not available. Please try again later.'
-      });
-    }
-
-    // Configure mail options
-    const mailOptions = {
-      from: `"Chat App" <${emailUser}>`,
-      to: email,
-      subject: 'Your Verification Code',
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 5px;">
-          <h2 style="color: #333;">Your Verification Code</h2>
-          <p>Please use the following code to verify your account:</p>
-          <div style="background-color: #f5f5f5; padding: 15px; font-size: 24px; text-align: center; letter-spacing: 5px; font-weight: bold;">
-            ${otp}
-          </div>
-          <p style="margin-top: 20px;">This code will expire in 1 hour.</p>
-          <p>If you didn't request this code, please ignore this email.</p>
-        </div>
-      `
-    };
-
-    // Send email
-    try {
-      const info = await transporter.sendMail(mailOptions);
-      console.log('✅ Email sent successfully:', info.messageId);
-
-      return res.status(200).json({
-        message: 'Verification code sent to your email'
-      });
-    } catch (emailError) {
-      console.error('❌ Failed to send email:', emailError);
-      return res.status(500).json({
-        message: 'Failed to send verification email. Please try again later.'
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Error in send-verification-otp:', error);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// SECURITY: Verify OTP with rate limiting and validation
-app.post('/verify-otp', authLimiter, validators.verifyOtp, async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-
-    console.log('Verifying OTP -', 'Email:', email, 'Submitted OTP:', otp);
-
-    // Find user
-    const user = findUserByEmail(email);
-    if (!user) {
-      console.log('User not found');
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    console.log('User found:', user.username);
-    console.log('Stored token:', user.verificationToken);
-    console.log('Token expires:', user.verificationTokenExpires);
-
-    // Check if OTP exists
-    if (!user.verificationToken) {
-      console.log('No verification token found');
-      return res.status(400).json({
-        message: 'No verification code found. Please request a new one.'
-      });
-    }
-
-    // Convert both to strings for comparison
-    const submittedOtp = String(otp);
-    const storedToken = String(user.verificationToken);
-
-    console.log('Comparing:', submittedOtp, 'vs', storedToken);
-
-    // Check if OTP matches
-    if (submittedOtp !== storedToken) {
-      console.log('Invalid OTP');
-      return res.status(400).json({ message: 'Invalid verification code' });
-    }
-
-    // Check if token is expired
-    if (user.verificationTokenExpires < Date.now()) {
-      console.log('Token expired');
-      return res.status(400).json({
-        message: 'Verification code expired. Please request a new one.'
-      });
-    }
-
-    // Mark user as verified
-    user.isVerified = true;
-    user.verificationToken = undefined;
-    user.verificationTokenExpires = undefined;
-    // in memory update
-
-    console.log('User verified successfully');
-
-    // Create token
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    // Return token with showAlert flag for SweetAlert
-    return res.status(200).json({
-      message: 'Email verified successfully',
-      token,
-      username: user.username,
-      nextStep: 'chatlanding',
-      redirectTo: '/chatlanding',
-      showAlert: true,
-      alertTitle: 'Verification Successful!',
-      alertText: 'Your email has been verified. Welcome to the app!',
-      alertIcon: 'success'
-    });
-
-  } catch (error) {
-    console.error('OTP verification error:', error);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Add a verification status check endpoint
-app.post('/check-verification-status', async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-
-    const user = findUserByEmail(email);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    res.status(200).json({
-      hasVerificationToken: !!user.verificationToken,
-      tokenExpired: user.verificationTokenExpires < Date.now(),
-      isVerified: user.isVerified
-    });
-
-  } catch (error) {
-    console.error('Error checking verification status:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// SECURITY: Debug endpoint - ONLY available in development
-app.post('/generate-test-otp', async (req, res) => {
-  // Protect debug endpoint in production
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ message: 'Not found' });
-  }
-
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-
-    const user = findUserByEmail(email);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    // Generate a test OTP
-    const otp = "123456";
-
-    // Save it to the user
-    user.verificationToken = otp;
-    user.verificationTokenExpires = Date.now() + 3600000; // 1 hour
-    // in memory update
-
-    return res.status(200).json({
-      message: 'Test OTP generated',
-      email,
-      otp
-    });
-  } catch (error) {
-    console.error('Error generating test OTP:', error);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// SECURITY: Debug endpoint - ONLY available in development
-app.get('/debug/routes', (req, res) => {
-  // Protect debug endpoint in production
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ message: 'Not found' });
-  }
-
-  const routes = [];
-
-  app._router.stack.forEach((middleware) => {
-    if (middleware.route) {
-      // Routes registered directly on the app
-      routes.push({
-        path: middleware.route.path,
-        methods: Object.keys(middleware.route.methods).join(', ')
-      });
-    } else if (middleware.name === 'router') {
-      // Routes added via router
-      middleware.handle.stack.forEach((handler) => {
-        if (handler.route) {
-          routes.push({
-            path: handler.route.path,
-            methods: Object.keys(handler.route.methods).join(', ')
-          });
-        }
-      });
-    }
-  });
-
-  res.json(routes);
-});
-
-// SECURITY: Debug endpoint - ONLY available in development
-app.post('/debug-verify', async (req, res) => {
-  // Protect debug endpoint in production
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ message: 'Not found' });
-  }
-
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-
-    console.log('Debug verification requested for:', email);
-
-    // Find user
-    const user = findUserByEmail(email);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found with email: ' + email });
-    }
-
-    // Force verify this user
-    user.isVerified = true;
-    // in memory update
-
-    // Create token
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log('User verified via debug endpoint:', user.username);
-
-    return res.status(200).json({
-      message: 'Debug verification successful',
-      token,
-      username: user.username
-    });
-  } catch (error) {
-    console.error('Debug verification error:', error);
-    return res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// SECURITY: Debug endpoint - ONLY available in development
-app.post('/simple-verify', async (req, res) => {
-  // Protect debug endpoint in production
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(404).json({ message: 'Not found' });
-  }
-
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: 'Email is required' });
-    }
-
-    console.log('Simple verification requested for:', email);
-
-    // Find user
-    const user = findUserByEmail(email);
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found with email: ' + email });
-    }
-
-    // Generate a code and save it immediately
-    const code = "123456";
-    user.verificationToken = code;
-    user.verificationTokenExpires = Date.now() + 3600000;
-    // in memory update
-
-    console.log('Generated and saved verification code for user:', user.username);
-
-    // Now verify this user with the same code
-    if (user.verificationToken !== code) {
-      return res.status(400).json({
-        message: 'Verification failed - token mismatch',
-        savedToken: user.verificationToken,
-        generatedCode: code
-      });
-    }
-
-    // Verify user
-    user.isVerified = true;
-    // in memory update
-
-    // Create token
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    console.log('User verified via simple endpoint:', user.username);
-
-    return res.status(200).json({
-      message: 'Simple verification successful',
-      token,
-      username: user.username
-    });
-  } catch (error) {
-    console.error('Simple verification error:', error);
-    return res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
+// Auth routes cleanup - removed OTP and debug routes
 
 app.get('/test', (req, res) => {
   res.json({ message: 'Backend is alive' });
@@ -2112,23 +1592,9 @@ app.get("/favicon.ico", (req, res) => {
   res.status(204).send();
 });
 
-// --- CORS middleware for audio files (MOBILE/iOS SAFE) ---
-app.use(['/uploads', '/audio'], (req, res, next) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
-  res.set('Accept-Ranges', 'bytes');
-  next();
-});
+// Mobile/iOS CORS managed by global cors middleware
 
-// Explicit OPTIONS handler for /uploads/* and /audio/* (for mobile/iOS CORS)
-app.options(['/uploads/*', '/audio/*'], (req, res) => {
-  res.set('Access-Control-Allow-Origin', '*');
-  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Origin, Range');
-  res.set('Accept-Ranges', 'bytes');
-  res.sendStatus(200);
-});
+setupSocket(server);
 
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
