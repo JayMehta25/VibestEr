@@ -1656,11 +1656,23 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Private Room Logic ---
+  // --- Dashboard Registration & Online Status ---
   socket.on('register', (username) => {
-    userSocketMap.set(socket.id, username);
-    socketToUserMap.set(socket.id, username); // Map socket ID to username
-    console.log(`User ${username} registered with socket ID ${socket.id}`);
+    if (!username) return;
+    const key = username.toLowerCase();
+    socket.dmUsername = key;
+    userSocketMap.set(key, socket.id);
+    socketToUserMap.set(socket.id, key);
+    console.log(`[register] ${username} → ${socket.id}`);
+
+    // Broadcast updated online users list
+    const onlineUsers = Array.from(userSocketMap.keys());
+    io.emit('onlineUsersList', onlineUsers);
+  });
+
+  socket.on('getOnlineUsers', () => {
+    const onlineUsers = Array.from(userSocketMap.keys());
+    socket.emit('onlineUsersList', onlineUsers);
   });
 
   // Add connection error logging
@@ -1675,16 +1687,29 @@ io.on('connection', (socket) => {
 
   // Add disconnection logging with reason
   socket.on('disconnect', (reason) => {
-    // Disconnection logging disabled to reduce terminal noise
     // console.log(`Socket ${socket.id} disconnected. Reason: ${reason}`);
 
-    // Remove from all rooms
-    for (const [userId, socketId] of userSocketMap.entries()) {
-      if (socketId === socket.id) {
-        userSocketMap.delete(userId);
-        socketToUserMap.delete(socket.id); // Remove from socketToUserMap
-        console.log(`Removed user ${userId} from socket mapping`);
-        break;
+    // Cleanup from userSocketMap and socketToUserMap
+    const username = socketToUserMap.get(socket.id);
+    if (username) {
+      userSocketMap.delete(username);
+      socketToUserMap.delete(socket.id);
+      console.log(`Removed user ${username} from socket mapping on disconnect`);
+
+      // Broadcast updated online users list
+      const onlineUsers = Array.from(userSocketMap.keys());
+      io.emit('onlineUsersList', onlineUsers);
+    }
+
+    // Clean up from all mesh rooms (voice calls)
+    for (const [room, peers] of Object.entries(meshRooms)) {
+      const peerIndex = peers.findIndex(p => p.id === socket.id);
+      if (peerIndex !== -1) {
+        peers.splice(peerIndex, 1);
+        io.to(room).emit('user-count', peers.length);
+        io.to(room).emit('participants-list', peers);
+        io.to(room).emit('peer-disconnected', socket.id);
+        if (peers.length === 0) delete meshRooms[room];
       }
     }
 
@@ -1992,31 +2017,6 @@ io.on('connection', (socket) => {
   // Handle WebRTC signaling (moved outside join handler)
   socket.on('signal', ({ to, data }) => {
     io.to(to).emit('signal', { from: socket.id, data });
-  });
-
-  // Clean up on disconnect
-  socket.on('disconnect', () => {
-    // console.log(`Voice call user ${socket.id} disconnected`);
-    // Clean up from all mesh rooms
-    for (const [room, peers] of Object.entries(meshRooms)) {
-      const peerIndex = peers.findIndex(p => p.id === socket.id);
-      if (peerIndex !== -1) {
-        meshRooms[room].splice(peerIndex, 1);
-        io.to(room).emit('user-count', meshRooms[room].length);
-        io.to(room).emit('participants-list', meshRooms[room]);
-        io.to(room).emit('peer-disconnected', socket.id);
-        if (meshRooms[room].length === 0) delete meshRooms[room];
-      }
-    }
-  });
-  // ── Dashboard DM: register user's username→socketId ──────────────────
-  socket.on('register', (username) => {
-    if (!username) return;
-    const key = username.toLowerCase();
-    socket.dmUsername = key;
-    userSocketMap.set(key, socket.id);
-    socketToUserMap.set(socket.id, key);
-    console.log(`[register] ${username} → ${socket.id}`);
   });
 
   // ── Dashboard DM: forward message to recipient in real-time ──────────
