@@ -2009,6 +2009,30 @@ io.on('connection', (socket) => {
       }
     }
   });
+  // ── Dashboard DM: register user's username→socketId ──────────────────
+  socket.on('register', (username) => {
+    if (!username) return;
+    const key = username.toLowerCase();
+    socket.dmUsername = key;
+    userSocketMap.set(key, socket.id);
+    socketToUserMap.set(socket.id, key);
+    console.log(`[register] ${username} → ${socket.id}`);
+  });
+
+  // ── Dashboard DM: forward message to recipient in real-time ──────────
+  socket.on('dashboardMessage', ({ to, from, content }) => {
+    const targetSocketId = userSocketMap.get(to.toLowerCase());
+    if (targetSocketId) {
+      console.log(`[dashboardMessage] ${from} → ${to} (socket: ${targetSocketId})`);
+      io.to(targetSocketId).emit('incomingDashboardMessage', {
+        from,
+        content,
+        sent_at: new Date().toISOString(),
+      });
+    } else {
+      console.log(`[dashboardMessage] "${to}" not online. Online: [${Array.from(userSocketMap.keys()).join(', ')}]`);
+    }
+  });
 });
 
 // Define a route for the root URL
