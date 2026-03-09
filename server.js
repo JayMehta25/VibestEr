@@ -1675,6 +1675,17 @@ io.on('connection', (socket) => {
     socket.emit('onlineUsersList', onlineUsers);
   });
 
+  // Friend Request Logic
+  socket.on('sendFriendRequest', ({ to, from }) => {
+    const targetSocketId = userSocketMap.get(to.toLowerCase());
+    if (targetSocketId) {
+      console.log(`[sendFriendRequest] Forwarding from "${from}" to "${to}" (socket: ${targetSocketId})`);
+      io.to(targetSocketId).emit('incomingFriendRequest', { from });
+    } else {
+      console.log(`[sendFriendRequest] User "${to}" not online, skipping.`);
+    }
+  });
+
   // Add connection error logging
   socket.on('error', (error) => {
     console.error(`Socket error for ${socket.id}:`, error);
